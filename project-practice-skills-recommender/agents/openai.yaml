@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Practice Skills Recommender"
+  short_description: "识别技术栈并维护AGENTS.md的最佳实践Skills"
+  default_prompt: "Use $project-practice-skills-recommender to detect the project tech stack, propose best-practice skills, and update AGENTS.md after confirmation."
