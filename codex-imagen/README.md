@@ -108,7 +108,7 @@ git clone https://github.com/Akimixu-19897/myskills-repo/tree/main/codex-imagen.
 
 ## 最快开始
 
-如果你的 Codex 已经通过中转站工作，那么通常不需要额外写入 key。
+如果你的 Codex 当前使用的中转 API 同时支持图片生成，并且当前 Key 已开通图片模型权限，就不需要额外写入 Key。需要注意的是，大部分中转站会为生图单独提供 Key、Base URL 或模型权限，这种情况下必须按下文方式单独配置，不能直接复用 Codex 的对话 Key。
 
 ### 1. 检查配置
 

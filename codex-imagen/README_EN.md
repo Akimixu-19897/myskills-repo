@@ -102,7 +102,7 @@ After installation, Codex can use the Skill when you mention Codex Imagen image 
 
 ## Quick Start
 
-If Codex already works through your relay, no extra key file is usually needed.
+If the relay currently used by Codex also supports image generation and the current key has permission to use image models, no extra key file is needed. Most relay providers issue a separate key, base URL, or model permission for image generation; in that case, configure the image credentials separately as described below instead of reusing the Codex chat key.
 
 Check configuration:
 
