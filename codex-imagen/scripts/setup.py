@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""Configure or check codex-imagen private config files."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+SKILL_CONFIG = SKILL_DIR / ".secrets" / "config.json"
+CCSWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+CODEX_CONFIG = CODEX_HOME / "config.toml"
+CODEX_AUTH = CODEX_HOME / "auth.json"
+
+
+def user_config_path() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "codex-imagen" / "config.json"
+    return Path.home() / ".config" / "codex-imagen" / "config.json"
+
+
+def candidate_paths(include_skill_config: bool = True) -> list[Path]:
+    paths = []
+    env_path = os.environ.get("CODEX_IMAGEN_CONFIG")
+    if env_path:
+        paths.append(Path(env_path))
+    paths.extend(
+        [
+            Path.cwd() / "photo" / "api_key.json",
+            Path.cwd() / ".secrets" / "image_api.json",
+            Path.cwd() / ".secrets" / "codex_imagen.json",
+            SKILL_CONFIG if include_skill_config else None,
+            user_config_path(),
+            Path.home() / ".config" / "codex-imagen" / "config.json",
+            Path.home() / ".codex-imagen.json",
+        ]
+    )
+    deduped = []
+    seen = set()
+    for path in paths:
+        if path is None:
+            continue
+        key = str(path).lower()
+        if key not in seen:
+            deduped.append(path)
+            seen.add(key)
+    return deduped
+
+
+def load_json(path: Path, quiet: bool = False) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if not quiet:
+            print(f"BROKEN_CONFIG={path} ({exc})")
+        return None
+
+
+def check_json_config(path: Path, quiet: bool = False) -> int:
+    data = load_json(path, quiet=quiet)
+    if data is None:
+        return 1
+    api_key = (
+        data.get("api_key")
+        or data.get("apiKey")
+        or data.get("key")
+        or data.get("token")
+        or data.get("openai_api_key")
+        or data.get("OPENAI_API_KEY")
+    )
+    base_url = (
+        data.get("base_url")
+        or data.get("baseUrl")
+        or data.get("baseURL")
+        or data.get("api_base")
+        or data.get("endpoint")
+        or data.get("openai_base_url")
+        or data.get("OPENAI_BASE_URL")
+    )
+    model = data.get("model", "gpt-image-2")
+    if quiet:
+        return 0 if api_key and base_url else 2
+    print(f"CONFIG={path}")
+    print(f"API_KEY={redact(str(api_key)) if api_key else 'missing'}")
+    print(f"BASE_URL={base_url or 'missing'}")
+    print(f"MODEL={model}")
+    return 0 if api_key and base_url else 2
+
+
+def redact(value: str | None) -> str:
+    if not value:
+        return ""
+    return value[:4] + "..." + value[-4:] if len(value) > 10 else "***"
+
+
+def normalize_openai_base_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
+        return urlunsplit((parsed.scheme, parsed.netloc, "/v1", parsed.query, parsed.fragment))
+    return url
+
+
+def extract_base_url_from_ccswitch_config(config: Any) -> str | None:
+    if isinstance(config, dict):
+        for key in ("base_url", "baseUrl", "baseURL", "api_base", "endpoint", "openai_base_url", "OPENAI_BASE_URL"):
+            if config.get(key):
+                return str(config[key])
+        return None
+    if not isinstance(config, str):
+        return None
+    for key in ("base_url", "baseUrl", "baseURL", "api_base", "endpoint", "openai_base_url", "OPENAI_BASE_URL"):
+        match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*[\"']([^\"']+)[\"']", config)
+        if match:
+            return match.group(1)
+    return None
+
+
+def check() -> int:
+    if SKILL_CONFIG.exists():
+        skill_status = check_json_config(SKILL_CONFIG, quiet=True)
+        if skill_status == 0:
+            check_json_config(SKILL_CONFIG)
+            return 0
+
+    codex_status = check_codex(quiet_missing=True)
+    if codex_status == 0:
+        return 0
+    ccswitch_status = check_ccswitch(quiet_missing=True)
+    if ccswitch_status == 0:
+        return 0
+    found = False
+    for path in candidate_paths(include_skill_config=False):
+        if not path.exists():
+            continue
+        found = True
+        status = check_json_config(path)
+        if status != 1:
+            return status
+    if not found:
+        print("CONFIG=missing")
+        print("If Codex already uses a relay, run: python scripts/setup.py --check-codex")
+        print(f"Suggested skill-local path: {SKILL_CONFIG}")
+        print(f"Suggested user path: {user_config_path()}")
+        print("If you use ccswitch, run: python scripts/setup.py --check-ccswitch")
+    return 1
+
+
+def parse_toml(path: Path) -> dict[str, Any]:
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+    if tomllib is not None:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    return parse_codex_toml_fallback(path.read_text(encoding="utf-8"))
+
+
+def parse_codex_toml_fallback(text: str) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    section: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = [part.strip().strip('"').strip("'") for part in line.strip("[]").split(".")]
+            current = data
+            for part in section:
+                current = current.setdefault(part, {})
+            continue
+        if "=" not in line:
+            continue
+        key, raw_value = [part.strip() for part in line.split("=", 1)]
+        value = raw_value.strip().strip('"').strip("'")
+        current = data
+        for part in section:
+            current = current.setdefault(part, {})
+        current[key] = value
+    return data
+
+
+def check_codex(
+    config_path: Path = CODEX_CONFIG,
+    auth_path: Path = CODEX_AUTH,
+    quiet_missing: bool = False,
+) -> int:
+    if not config_path.exists() or not auth_path.exists():
+        if not quiet_missing:
+            print(f"CODEX_CONFIG={'missing' if not config_path.exists() else config_path}")
+            print(f"CODEX_AUTH={'missing' if not auth_path.exists() else auth_path}")
+        return 1
+    try:
+        config = parse_toml(config_path)
+        auth = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        if not quiet_missing:
+            print(f"CODEX_ERROR={exc}")
+        return 1
+    provider_name = config.get("model_provider")
+    providers = config.get("model_providers") if isinstance(config.get("model_providers"), dict) else {}
+    provider = providers.get(provider_name) if provider_name else None
+    if not isinstance(provider, dict):
+        if not quiet_missing:
+            print("CODEX_PROVIDER=missing")
+        return 1
+    api_key = (
+        auth.get("api_key")
+        or auth.get("apiKey")
+        or auth.get("key")
+        or auth.get("token")
+        or auth.get("openai_api_key")
+        or auth.get("OPENAI_API_KEY")
+    )
+    base_url = (
+        provider.get("base_url")
+        or provider.get("baseUrl")
+        or provider.get("baseURL")
+        or provider.get("api_base")
+        or provider.get("endpoint")
+        or provider.get("openai_base_url")
+        or provider.get("OPENAI_BASE_URL")
+    )
+    image_model = provider.get("image_model") or provider.get("imageModel") or "gpt-image-2"
+    print(f"CODEX_CONFIG={config_path}")
+    print(f"CODEX_AUTH={auth_path}")
+    print(f"CODEX_PROVIDER={provider_name}")
+    print(f"API_KEY={redact(str(api_key)) if api_key else 'missing'}")
+    print(f"BASE_URL={normalize_openai_base_url(str(base_url)) if base_url else 'missing'}")
+    print(f"MODEL={image_model}")
+    return 0 if api_key and base_url else 2
+
+
+def check_ccswitch(db_path: Path = CCSWITCH_DB, app_type: str = "codex", quiet_missing: bool = False) -> int:
+    if not db_path.exists():
+        if not quiet_missing:
+            print(f"CCSWITCH_DB=missing ({db_path})")
+        return 1
+    try:
+        con = sqlite3.connect(db_path)
+        con.row_factory = sqlite3.Row
+        provider = con.execute(
+            "select id, name, settings_config from providers where app_type=? and is_current=1 limit 1",
+            (app_type,),
+        ).fetchone()
+        if provider is None:
+            if not quiet_missing:
+                print(f"CCSWITCH_PROVIDER=missing app_type={app_type}")
+            return 1
+        settings = json.loads(provider["settings_config"] or "{}")
+        auth = settings.get("auth") if isinstance(settings.get("auth"), dict) else {}
+        api_key = (
+            auth.get("api_key")
+            or auth.get("apiKey")
+            or auth.get("key")
+            or auth.get("token")
+            or auth.get("openai_api_key")
+            or auth.get("OPENAI_API_KEY")
+        )
+        endpoint = con.execute(
+            "select url from provider_endpoints where app_type=? and provider_id=? order by id asc limit 1",
+            (app_type, provider["id"]),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        if not quiet_missing:
+            print(f"CCSWITCH_ERROR={exc}")
+        return 1
+    except json.JSONDecodeError as exc:
+        if not quiet_missing:
+            print(f"CCSWITCH_SETTINGS_ERROR={exc}")
+        return 1
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    print(f"CCSWITCH_DB={db_path}")
+    print(f"CCSWITCH_PROVIDER={provider['name']} ({provider['id']})")
+    print(f"API_KEY={redact(str(api_key)) if api_key else 'missing'}")
+    base_url = extract_base_url_from_ccswitch_config(settings.get("config"))
+    if not base_url and endpoint:
+        base_url = endpoint["url"]
+    print(f"BASE_URL={normalize_openai_base_url(base_url) if base_url else 'missing'}")
+    print("MODEL=gpt-image-2")
+    return 0 if api_key and base_url else 2
+
+
+def write_config(path: Path, overwrite: bool) -> int:
+    if path.exists() and not overwrite:
+        print(f"Config already exists: {path}")
+        print("Use --force to overwrite it.")
+        return 2
+    print(f"Writing private relay config to: {path}")
+    base_url = input("Relay base_url: ").strip()
+    model = input("Model [gpt-image-2]: ").strip() or "gpt-image-2"
+    api_key = getpass.getpass("API key (hidden): ").strip()
+    if not api_key or not base_url:
+        print("api_key and base_url are required.", file=sys.stderr)
+        return 1
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"api_key": api_key, "base_url": base_url, "model": model}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print("WROTE_CONFIG=1")
+    print(f"CONFIG={path}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Set up codex-imagen private config.")
+    parser.add_argument("command", nargs="?", choices=["config"], help="Create or update a config file.")
+    parser.add_argument("--check", action="store_true", help="Check the first usable config without printing secrets.")
+    parser.add_argument("--check-codex", action="store_true", help="Check the current Codex config/auth provider.")
+    parser.add_argument("--codex-config", help="Override the Codex config.toml path.")
+    parser.add_argument("--codex-auth", help="Override the Codex auth.json path.")
+    parser.add_argument("--check-ccswitch", action="store_true", help="Check the current ccswitch Codex provider.")
+    parser.add_argument("--ccswitch-db", help="Override the ccswitch SQLite database path.")
+    parser.add_argument(
+        "--scope",
+        choices=["skill", "user"],
+        default="skill",
+        help="Where to write config with the config command. Default: skill.",
+    )
+    parser.add_argument("--force", action="store_true", help="Overwrite an existing config.")
+    args = parser.parse_args()
+
+    if args.check_codex:
+        return check_codex(
+            Path(args.codex_config) if args.codex_config else CODEX_CONFIG,
+            Path(args.codex_auth) if args.codex_auth else CODEX_AUTH,
+        )
+    if args.check_ccswitch:
+        return check_ccswitch(Path(args.ccswitch_db) if args.ccswitch_db else CCSWITCH_DB)
+    if args.check or not args.command:
+        return check()
+    target = SKILL_CONFIG if args.scope == "skill" else user_config_path()
+    return write_config(target, args.force)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

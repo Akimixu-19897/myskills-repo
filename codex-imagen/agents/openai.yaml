@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Imagen"
+  short_description: "Relay image generation with saved prompts"
+  default_prompt: "Use the Codex Imagen workflow to create or edit an image through current Codex config, ccswitch, or private relay config, save the prompt and non-secret run metadata, and avoid persistent API key environment variables."
